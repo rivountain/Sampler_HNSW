@@ -3,14 +3,15 @@
  * @brief High-speed Data Acquisition Firmware for Teensy 3.2 and AD9220
  *
  * Testing Strategy:
- * The core logic for this firmware revolves around COBS encoding/decoding,
- * DMA hardware transfers, and hardware PWM generation.
+ * The core logic revolves around PacketSerial (COBS), DMA hardware transfers,
+ * hardware PWM generation, and circular buffer extraction.
  * Desktop unit testing would involve mocking Serial interfaces and Cortex-M
  * registers (e.g. DMA_TCD, FTM0, PDB).
  * Hardware-in-the-loop (HIL) testing is recommended for DMA and Timer verification.
  */
 
 #include <Arduino.h>
+#include <PacketSerial.h>
 #include <stdint.h>
 #include <stddef.h>
 #include <stdbool.h>
@@ -22,6 +23,8 @@
 #define PIN_POWER_CONTROL 18
 #define PIN_SOLENOID 9
 #define PIN_CLOCK 22 /* PTC1 - FTM0_CH0 */
+#define PIN_STEPPER_DIR 3
+#define PIN_STEPPER_STEP 4
 
 /*
  * The AD9220 pins chosen perfectly map to the lower 8 bits of GPIOD on the Teensy 3.2 (K20 CPU).
@@ -46,9 +49,13 @@
 static void my_init_pins(void) {
     pinMode(PIN_POWER_CONTROL, OUTPUT);
     pinMode(PIN_SOLENOID, OUTPUT);
+    pinMode(PIN_STEPPER_DIR, OUTPUT);
+    pinMode(PIN_STEPPER_STEP, OUTPUT);
 
     digitalWriteFast(PIN_POWER_CONTROL, LOW);
     digitalWriteFast(PIN_SOLENOID, LOW);
+    digitalWriteFast(PIN_STEPPER_DIR, LOW);
+    digitalWriteFast(PIN_STEPPER_STEP, LOW);
 
     /* ADC Pins as inputs */
     pinMode(PIN_ADC_BIT1, INPUT);
@@ -67,15 +74,17 @@ static void my_init_pins(void) {
  */
 #define TARGET_SAMPLE_RATE_HZ 2000000
 #define NUM_DATA_POINTS 3000
+#define PRE_TRIGGER_POINTS 200
+#define POST_TRIGGER_POINTS (NUM_DATA_POINTS - PRE_TRIGGER_POINTS)
 
-/* Buffer layout: Header (3 bytes) + Payload (3000 bytes) */
-static uint8_t payload_buffer[3 + NUM_DATA_POINTS];
-static volatile bool dma_transfer_done = false;
-
-static void dma_isr(void) {
-    DMA_CINT = 0; /* Clear interrupt flag for channel 0 */
-    dma_transfer_done = true;
-}
+/*
+ * DMA Circular Buffer.
+ * Must be aligned to its size for the Kinetis K20 DMA modulo feature.
+ * We use a 4096-byte (4KB) buffer.
+ */
+#define DMA_BUFFER_SIZE 4096
+#define DMA_BUFFER_MASK (DMA_BUFFER_SIZE - 1)
+uint8_t dma_ring_buffer[DMA_BUFFER_SIZE] __attribute__((aligned(DMA_BUFFER_SIZE)));
 
 static void init_timer_and_dma(void) {
     /* Enable clocks for DMA and DMAMUX */
@@ -84,22 +93,18 @@ static void init_timer_and_dma(void) {
     SIM_SCGC6 |= SIM_SCGC6_FTM0;
 
     /* 1. Setup FTM0 to generate a 2MHz PWM clock on PIN 22 (PTC1, FTM0_CH0) */
-    /* And trigger DMA on FTM0 CH0 overflow/match */
 
     /* Set Pin 22 (PTC1) to FTM0_CH0 alternate function (ALT4) AND enable PORT DMA */
-    /* The K20 requires PORT DMA to auto-clear flags without CPU intervention.
-       IRQC(1) = DMA on rising edge (when clock pulse starts) */
     PORTC_PCR1 = PORT_PCR_MUX(4) | PORT_PCR_IRQC(1);
 
     FTM0_SC = 0; /* Disable timer while configuring */
     FTM0_CNT = 0;
 
-    /* Calculate modulo for 2MHz based on F_BUS (typically 48MHz on Teensy 3.2 at 96MHz F_CPU) */
+    /* Calculate modulo for 2MHz based on F_BUS */
     uint32_t modulo = (F_BUS / TARGET_SAMPLE_RATE_HZ) - 1;
     FTM0_MOD = modulo;
 
-    /* Set channel 0 to Edge-aligned PWM (High-true pulses).
-       No FTM interrupts/DMA enabled here; the physical pin toggle triggers PORTC DMA. */
+    /* Set channel 0 to Edge-aligned PWM (High-true pulses) */
     FTM0_C0SC = FTM_CSC_MSB | FTM_CSC_ELSB;
     FTM0_C0V = (modulo + 1) / 2; /* 50% duty cycle */
 
@@ -108,127 +113,66 @@ static void init_timer_and_dma(void) {
     DMAMUX0_CHCFG0 = DMAMUX_DISABLE;
     DMAMUX0_CHCFG0 = DMAMUX_SOURCE_PORTC | DMAMUX_ENABLE;
 
-    /* Enable interrupt in NVIC for DMA CH 0 */
-    NVIC_ENABLE_IRQ(IRQ_DMA_CH0);
-    attachInterruptVector(IRQ_DMA_CH0, dma_isr);
-
     /* Start Timer (System Clock, Prescaler 1) */
     FTM0_SC = FTM_SC_CLKS(1) | FTM_SC_PS(0);
 }
 
-static void start_dma_capture(uint8_t* dest_buffer, uint32_t count) {
-    dma_transfer_done = false;
-
-    /* Disable DMA channel while configuring */
+static void start_continuous_dma(void) {
     DMA_CERQ = 0;
 
-    /* Source: GPIOD_PDIR (Port D Input Data Register).
-       Since our pins map to bits 0-7, we can read the lower 8 bits directly. */
     DMA_TCD0_SADDR = &GPIOD_PDIR;
-    DMA_TCD0_SOFF = 0; /* Don't increment source address */
-    /* SSIZE = 0 (8-bit), DSIZE = 0 (8-bit) */
-    DMA_TCD0_ATTR = DMA_TCD_ATTR_SSIZE(0) | DMA_TCD_ATTR_DSIZE(0);
+    DMA_TCD0_SOFF = 0;
 
-    /* Destination: our payload buffer */
-    DMA_TCD0_DADDR = dest_buffer;
-    DMA_TCD0_DOFF = 1; /* Increment destination by 1 byte */
+    /* DMOD = 12 (2^12 = 4096 bytes) for circular destination buffer. */
+    DMA_TCD0_ATTR = DMA_TCD_ATTR_SMOD(0) | DMA_TCD_ATTR_SSIZE(0) |
+                    DMA_TCD_ATTR_DMOD(12) | DMA_TCD_ATTR_DSIZE(0);
 
-    /* Number of bytes to transfer per request (1 byte) */
+    DMA_TCD0_DADDR = dma_ring_buffer;
+    DMA_TCD0_DOFF = 1;
     DMA_TCD0_NBYTES_MLNO = 1;
 
-    /* Total number of transfers */
-    DMA_TCD0_CITER_ELINKNO = count;
-    DMA_TCD0_BITER_ELINKNO = count;
+    /* Continuous background transfer */
+    DMA_TCD0_CITER_ELINKNO = DMA_BUFFER_SIZE;
+    DMA_TCD0_BITER_ELINKNO = DMA_BUFFER_SIZE;
 
-    /* Last destination address adjustment (not needed as we re-setup each time) */
     DMA_TCD0_SLAST = 0;
-    DMA_TCD0_DLASTSGA = 0;
+    DMA_TCD0_DLASTSGA = -DMA_BUFFER_SIZE;
 
-    /* Enable Interrupt on Major Completion AND Disable Request on Completion
-       (Prevents buffer overrun since the FTM clock is continuous) */
-    DMA_TCD0_CSR = DMA_TCD_CSR_INTMAJOR | DMA_TCD_CSR_DREQ;
+    DMA_TCD0_CSR = 0;
 
-    /* Enable DMA Request for Channel 0 */
     DMA_SERQ = 0;
 }
 
-
-/* -----------------------------------------------------------------------------
- * COBS Protocol
- * -----------------------------------------------------------------------------
- */
-static size_t cobs_encode(const uint8_t* input, size_t length, uint8_t* output) {
-    if (!input || !output) return 0;
-
-    size_t read_index = 0;
-    size_t write_index = 1;
-    size_t code_index = 0;
-    uint8_t code = 1;
-
-    while (read_index < length) {
-        if (input[read_index] == 0) {
-            output[code_index] = code;
-            code = 1;
-            code_index = write_index++;
-            read_index++;
-        } else {
-            output[write_index++] = input[read_index++];
-            code++;
-            if (code == 0xFF) {
-                output[code_index] = code;
-                code = 1;
-                code_index = write_index++;
-            }
-        }
-    }
-    output[code_index] = code;
-    return write_index;
+static void stop_dma(void) {
+    DMA_CERQ = 0;
 }
 
-static size_t cobs_decode(const uint8_t* input, size_t length, uint8_t* output) {
-    if (!input || !output || length == 0) return 0;
-
-    size_t read_index = 0;
-    size_t write_index = 0;
-    uint8_t code = 0;
-    uint8_t i = 0;
-
-    while (read_index < length) {
-        code = input[read_index];
-        if (read_index + code > length && code != 1) {
-            return 0; /* Error: malformed frame */
-        }
-        read_index++;
-        for (i = 1; i < code; i++) {
-            output[write_index++] = input[read_index++];
-        }
-        if (code != 0xFF && read_index != length) {
-            output[write_index++] = 0;
-        }
-    }
-    return write_index;
+static uint32_t get_dma_write_index(void) {
+    return ((uint32_t)DMA_TCD0_DADDR) - ((uint32_t)dma_ring_buffer);
 }
+
 
 /* -----------------------------------------------------------------------------
  * Acquisition System State
  * -----------------------------------------------------------------------------
  */
-#define START_HUNT_TIMEOUT_US 10000
+#define START_HUNT_TIMEOUT_US 50000
 #define MAX_SOLENOID_RETRIES 3
 
 static uint8_t average_noise = 0;
-static uint8_t tx_buffer[sizeof(payload_buffer) + (sizeof(payload_buffer) / 254) + 2];
+static uint8_t payload_buffer[3 + NUM_DATA_POINTS];
 
-#define RX_BUFFER_SIZE 64
-static uint8_t rx_buffer[RX_BUFFER_SIZE];
-static size_t rx_index = 0;
-static uint8_t raw_match_index = 0;
-static const uint8_t expected_command[3] = {0xAA, 0x55, 0x01};
+PacketSerial myPacketSerial;
+volatile bool trigger_received = false;
 
-/* Read the lower 8 bits of GPIOD directly for hunting phase */
-static inline uint8_t read_adc_pins_direct(void) __attribute__((always_inline));
-static inline uint8_t read_adc_pins_direct(void) {
-    return (uint8_t)(GPIOD_PDIR & 0xFF);
+static void step_motor_full(void) {
+    /* Full implementation of a stepper motor step (blocking for safety) */
+    for(int i = 0; i < 200; i++) { /* 200 steps = 1 revolution typically */
+        digitalWriteFast(PIN_STEPPER_STEP, HIGH);
+        delayMicroseconds(500);
+        digitalWriteFast(PIN_STEPPER_STEP, LOW);
+        delayMicroseconds(500);
+    }
 }
 
 static void trigger_solenoid(void) {
@@ -238,35 +182,68 @@ static void trigger_solenoid(void) {
 }
 
 static void calibrate_noise(void) {
+    start_continuous_dma();
+    delay(10); /* Let DMA fill the buffer with noise */
+    stop_dma();
+
     uint32_t sum = 0;
     const uint16_t CALIBRATION_SAMPLES = 256;
     for (uint16_t i = 0; i < CALIBRATION_SAMPLES; i++) {
-        sum += read_adc_pins_direct(); /* Clock is running in background via PWM */
-        delayMicroseconds(10);
+        sum += dma_ring_buffer[i];
     }
     average_noise = (uint8_t)(sum / CALIBRATION_SAMPLES);
+}
+
+static void extract_dma_buffer(uint32_t trigger_index, uint8_t* out_payload) {
+    uint32_t start_index = (trigger_index + DMA_BUFFER_SIZE - PRE_TRIGGER_POINTS) & DMA_BUFFER_MASK;
+
+    out_payload[0] = 0xAA;
+    out_payload[1] = 0x55;
+    out_payload[2] = 0x02;
+
+    uint8_t* data_ptr = &out_payload[3];
+    for (uint32_t i = 0; i < NUM_DATA_POINTS; i++) {
+        *data_ptr++ = dma_ring_buffer[(start_index + i) & DMA_BUFFER_MASK];
+    }
 }
 
 static void acquire_and_transmit(void) {
     uint8_t retries = 0;
     bool signal_found = false;
-    const uint8_t THRESHOLD = average_noise + 5;
+
+    /* Prevent overflow if average_noise is near 255 */
+    uint8_t THRESHOLD = (uint8_t)(average_noise + 5);
+    if (average_noise > 250) {
+        THRESHOLD = 255;
+    }
+
+    uint32_t trigger_idx = 0;
 
     /* 1. Retry mechanism for Solenoid triggering */
     while (retries < MAX_SOLENOID_RETRIES && !signal_found) {
+        start_continuous_dma();
         trigger_solenoid();
 
         elapsedMicros hunt_timer = 0;
+        uint32_t read_idx = get_dma_write_index();
+
         while (hunt_timer < START_HUNT_TIMEOUT_US) {
-            if (read_adc_pins_direct() > THRESHOLD) {
-                signal_found = true;
-                break;
+            uint32_t current_write_idx = get_dma_write_index();
+
+            while (read_idx != current_write_idx) {
+                if (dma_ring_buffer[read_idx] > THRESHOLD) {
+                    signal_found = true;
+                    trigger_idx = read_idx;
+                    break;
+                }
+                read_idx = (read_idx + 1) & DMA_BUFFER_MASK;
             }
+            if (signal_found) break;
         }
 
         if (!signal_found) {
+            stop_dma();
             retries++;
-            /* Wait before retrying to let physical mechanics settle */
             delay(100);
         }
     }
@@ -275,94 +252,55 @@ static void acquire_and_transmit(void) {
     if (!signal_found) {
         payload_buffer[0] = 0xAA;
         payload_buffer[1] = 0x55;
-        payload_buffer[2] = 0x03; /* 0x03 indicates Timeout/Error */
+        payload_buffer[2] = 0x05; /* 0x05 indicates Timeout/Error (0x03, 0x04 reserved for Stepper) */
 
-        size_t encoded_len = cobs_encode(payload_buffer, 3, tx_buffer);
-        if (encoded_len > 0 && encoded_len < sizeof(tx_buffer)) {
-            tx_buffer[encoded_len] = 0x00;
-            Serial2.write(tx_buffer, encoded_len + 1);
+        /* PacketSerial automatically handles encoding and appending the 0x00 boundary */
+        myPacketSerial.send(payload_buffer, 3);
+        return;
+    }
+
+    /* 3. Signal found. Let DMA continue running to capture POST_TRIGGER_POINTS */
+    while (1) {
+        uint32_t current = get_dma_write_index();
+        uint32_t distance_written = (current + DMA_BUFFER_SIZE - trigger_idx) & DMA_BUFFER_MASK;
+        if (distance_written >= POST_TRIGGER_POINTS) {
+            break;
         }
-        return; /* Exit early, do not sample */
     }
 
-    /* 3. Signal found, execute precise DMA capture */
-    payload_buffer[0] = 0xAA;
-    payload_buffer[1] = 0x55;
-    payload_buffer[2] = 0x02;
+    stop_dma();
 
-    uint8_t* data_ptr = &payload_buffer[3];
+    /* 4. Extract data and transmit */
+    extract_dma_buffer(trigger_idx, payload_buffer);
 
-    start_dma_capture(data_ptr, NUM_DATA_POINTS);
-
-    /* Wait for DMA transfer to complete */
-    while (!dma_transfer_done) {
-        /* CPU is free here. It could do other things, but we block to wait for acquisition. */
-    }
-
-    /* 4. Encode and transmit the data */
-    size_t encoded_len = cobs_encode(payload_buffer, sizeof(payload_buffer), tx_buffer);
-    if (encoded_len > 0 && encoded_len < sizeof(tx_buffer)) {
-        tx_buffer[encoded_len] = 0x00;
-        Serial2.write(tx_buffer, encoded_len + 1);
-    }
+    /* PacketSerial automatically handles encoding and appending the 0x00 boundary */
+    myPacketSerial.send(payload_buffer, sizeof(payload_buffer));
 }
 
 /* -----------------------------------------------------------------------------
- * Serial Manager
+ * Serial Packet Handler
  * -----------------------------------------------------------------------------
  */
-static bool process_frame(size_t frame_length) {
-    uint8_t decoded[RX_BUFFER_SIZE];
-    size_t decoded_len = cobs_decode(rx_buffer, frame_length, decoded);
+void onPacketReceived(const uint8_t* buffer, size_t size) {
+    if (size == 3 && buffer[0] == 0xAA && buffer[1] == 0x55) {
+        if (buffer[2] == 0x01) {
+            trigger_received = true;
+        } else if (buffer[2] == 0x03) {
+            /* Stepper motor Raise command implementation */
+            digitalWriteFast(PIN_STEPPER_DIR, HIGH);
+            step_motor_full();
 
-    if (decoded_len == sizeof(expected_command)) {
-        if (memcmp(decoded, expected_command, sizeof(expected_command)) == 0) {
-            return true;
+            uint8_t ack[] = {0xAA, 0x55, 0x03};
+            myPacketSerial.send(ack, 3);
+        } else if (buffer[2] == 0x04) {
+            /* Stepper motor Lower command implementation */
+            digitalWriteFast(PIN_STEPPER_DIR, LOW);
+            step_motor_full();
+
+            uint8_t ack[] = {0xAA, 0x55, 0x04};
+            myPacketSerial.send(ack, 3);
         }
     }
-    return false;
-}
-
-static bool check_for_command(void) {
-    bool trigger_received = false;
-
-    while (Serial2.available() > 0) {
-        int byte_read = Serial2.read();
-        if (byte_read < 0) continue;
-
-        uint8_t b = (uint8_t)byte_read;
-
-        /* Raw sequence detection fallback */
-        if (b == expected_command[raw_match_index]) {
-            raw_match_index++;
-            if (raw_match_index == sizeof(expected_command)) {
-                trigger_received = true;
-                /* Reset state */
-                raw_match_index = 0;
-                rx_index = 0;
-            }
-        } else {
-            raw_match_index = (b == expected_command[0]) ? 1 : 0;
-        }
-
-        /* COBS frame detection */
-        if (b == 0x00) {
-            if (rx_index > 0) {
-                if (process_frame(rx_index)) {
-                    trigger_received = true;
-                }
-                /* Reset frame builder */
-                rx_index = 0;
-            }
-        } else {
-            if (rx_index < RX_BUFFER_SIZE) {
-                rx_buffer[rx_index++] = b;
-            } else {
-                rx_index = 0;
-            }
-        }
-    }
-    return trigger_received;
 }
 
 void setup(void) {
@@ -373,6 +311,10 @@ void setup(void) {
     Serial2.setTX(31);
     Serial2.begin(1000000);
 
+    /* Setup PacketSerial */
+    myPacketSerial.setStream(&Serial2);
+    myPacketSerial.setPacketHandler(&onPacketReceived);
+
     /* Power on components */
     digitalWriteFast(PIN_POWER_CONTROL, HIGH);
     delay(100);
@@ -380,18 +322,22 @@ void setup(void) {
     /* Initialize DMA and hardware PWM */
     init_timer_and_dma();
 
-    trigger_solenoid();
     calibrate_noise();
 }
 
 void loop(void) {
-    if (check_for_command()) {
+    /* Process incoming serial data via PacketSerial */
+    myPacketSerial.update();
+
+    if (trigger_received) {
+        trigger_received = false;
+
         acquire_and_transmit();
 
-        /* Instead of blindly flushing the serial buffer (which could destroy the
-           start of the next command if it arrives quickly), we simply ensure our
-           parser state variables are clean. */
-        rx_index = 0;
-        raw_match_index = 0;
+        /*
+         * No need to flush manually; PacketSerial will elegantly process
+         * any remaining bytes in the stream as new packets on the next update().
+         * Overlapped commands won't corrupt the current execution.
+         */
     }
 }
