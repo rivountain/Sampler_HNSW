@@ -23,8 +23,6 @@
 #define PIN_POWER_CONTROL 18
 #define PIN_SOLENOID 9
 #define PIN_CLOCK 22 /* PTC1 - FTM0_CH0 */
-#define PIN_STEPPER_DIR 3
-#define PIN_STEPPER_STEP 4
 
 /*
  * The AD9220 pins chosen perfectly map to the lower 8 bits of GPIOD on the Teensy 3.2 (K20 CPU).
@@ -49,13 +47,9 @@
 static void my_init_pins(void) {
     pinMode(PIN_POWER_CONTROL, OUTPUT);
     pinMode(PIN_SOLENOID, OUTPUT);
-    pinMode(PIN_STEPPER_DIR, OUTPUT);
-    pinMode(PIN_STEPPER_STEP, OUTPUT);
 
     digitalWriteFast(PIN_POWER_CONTROL, LOW);
     digitalWriteFast(PIN_SOLENOID, LOW);
-    digitalWriteFast(PIN_STEPPER_DIR, LOW);
-    digitalWriteFast(PIN_STEPPER_STEP, LOW);
 
     /* ADC Pins as inputs */
     pinMode(PIN_ADC_BIT1, INPUT);
@@ -164,16 +158,6 @@ static uint8_t payload_buffer[3 + NUM_DATA_POINTS];
 
 PacketSerial myPacketSerial;
 volatile bool trigger_received = false;
-
-static void step_motor_full(void) {
-    /* Full implementation of a stepper motor step (blocking for safety) */
-    for(int i = 0; i < 200; i++) { /* 200 steps = 1 revolution typically */
-        digitalWriteFast(PIN_STEPPER_STEP, HIGH);
-        delayMicroseconds(500);
-        digitalWriteFast(PIN_STEPPER_STEP, LOW);
-        delayMicroseconds(500);
-    }
-}
 
 static void trigger_solenoid(void) {
     digitalWriteFast(PIN_SOLENOID, HIGH);
@@ -285,21 +269,8 @@ void onPacketReceived(const uint8_t* buffer, size_t size) {
     if (size == 3 && buffer[0] == 0xAA && buffer[1] == 0x55) {
         if (buffer[2] == 0x01) {
             trigger_received = true;
-        } else if (buffer[2] == 0x03) {
-            /* Stepper motor Raise command implementation */
-            digitalWriteFast(PIN_STEPPER_DIR, HIGH);
-            step_motor_full();
-
-            uint8_t ack[] = {0xAA, 0x55, 0x03};
-            myPacketSerial.send(ack, 3);
-        } else if (buffer[2] == 0x04) {
-            /* Stepper motor Lower command implementation */
-            digitalWriteFast(PIN_STEPPER_DIR, LOW);
-            step_motor_full();
-
-            uint8_t ack[] = {0xAA, 0x55, 0x04};
-            myPacketSerial.send(ack, 3);
         }
+        /* Note: 0x03 and 0x04 are reserved for Stepper Motor commands handled by another program/device on the bus. */
     }
 }
 
